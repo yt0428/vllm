@@ -33,12 +33,14 @@ from vllm.attention import Attention, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.distributed import (
+    divide,
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_gather,
 )
+from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -84,6 +86,88 @@ def check_ffn_act_fn(act_fn: str):
         raise ValueError(
             f"Unsupported activation: {act_fn}. Only silu is supported for now."
         )
+
+
+class AttentionWithSink(Attention):
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        # For attention with sink, we have sink q, k, v
+        sink_query: torch.Tensor | None = None,
+        sink_key: torch.Tensor | None = None,
+        sink_value: torch.Tensor | None = None,
+        v_head_size: int | None = None,
+        output_shape: torch.Size | None = None,
+    ) -> torch.Tensor:
+        """
+        The KV cache is stored inside this class and is accessed via
+        `self.kv_cache`.
+
+        Attention metadata (`attn_metadata`) is set using a context manager in
+        the model runner's `execute_model` method. It is accessed via forward
+        context using
+        `vllm.forward_context.get_forward_context().attn_metadata`.
+        """
+        if self.calculate_kv_scales:
+            torch.ops.vllm.maybe_calc_kv_scales(query, key, value, self.layer_name)
+        output_dtype = query.dtype
+        if self.query_quant is not None:
+            # quantizing with a simple torch operation enables
+            # torch.compile to fuse this into previous ops
+            # which reduces overheads during decoding.
+            # Otherwise queries are quantized using custom ops
+            # which causes decoding overheads
+            assert self.kv_cache_dtype in {"fp8", "fp8_e4m3"}
+
+            # check if query quantization is supported
+            if self.impl.supports_quant_query_input():
+                query, _ = self.query_quant(query, self._q_scale)
+
+        if self.use_output:
+            output_shape = output_shape if output_shape is not None else query.shape
+            if v_head_size is not None:
+                output_shape[-1] = v_head_size
+            output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
+            hidden_size = output_shape[-1]
+            # Reshape the query, key, and value tensors.
+            # NOTE(woosuk): We do this outside the custom op to minimize the
+            # CPU overheads from the non-CUDA-graph regions.
+            query = query.view(-1, self.num_heads, self.head_size)
+            output = output.view(-1, self.num_heads, hidden_size)
+            if key is not None:
+                key = key.view(-1, self.num_kv_heads, self.head_size)
+            if value is not None:
+                value = value.view(-1, self.num_kv_heads, hidden_size)
+            if self.use_direct_call:
+                forward_context: ForwardContext = get_forward_context()
+                attn_metadata = forward_context.attn_metadata
+                if isinstance(attn_metadata, dict):
+                    attn_metadata = attn_metadata[self.layer_name]
+                self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                self.impl.forward(
+                    self, query, key, value, self_kv_cache, attn_metadata, output=output
+                )
+            else:
+                torch.ops.vllm.unified_attention_with_sink_with_output(
+                    query, key, value, output, self.layer_name
+                )
+            return output.view(-1, hidden_size)
+        else:
+            if self.use_direct_call:
+                forward_context = get_forward_context()
+                attn_metadata = forward_context.attn_metadata
+                if isinstance(attn_metadata, dict):
+                    attn_metadata = attn_metadata[self.layer_name]
+                self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                return self.impl.forward(
+                    self, query, key, value, self_kv_cache, attn_metadata
+                )
+            else:
+                return torch.ops.vllm.unified_attention_with_sink(
+                    query, key, value, self.layer_name
+                )
 
 
 class OpenPanguMLP(nn.Module):
@@ -532,6 +616,262 @@ class OpenPanguEmbeddedAttention(nn.Module):
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
+            max_position=self.max_position_embeddings,
+            base=self.rope_theta,
+            rope_scaling=rope_scaling,
+            is_neox_style=is_neox_style,
+        )
+
+
+class OpenPanguSinkAttention(nn.Module):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        rope_theta: float = 10000,
+        rope_scaling: dict[str, Any] | None = None,
+        max_position_embeddings: int = 8192,
+        quant_config: QuantizationConfig | None = None,
+        bias: bool = False,
+        bias_o_proj: bool = False,
+        cache_config: CacheConfig | None = None,
+        prefix: str = "",
+        attn_type: str = AttentionType.DECODER,
+    ) -> None:
+        super().__init__()
+        layer_idx = extract_layer_index(prefix)
+        self.hidden_size = hidden_size
+        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = num_heads
+        if self.total_num_heads % tp_size != 0:
+            raise ValueError(
+                f"total_num_heads {self.total_num_heads} "
+                f"is not divisible by tp_size {tp_size}."
+            )
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads > tp_size and self.total_num_kv_heads % tp_size != 0:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel ranks.
+            raise ValueError(
+                "Number of KV heads is greater than TP size, "
+                f"but total_num_kv_heads {self.total_num_kv_heads} "
+                f"is not divisible by tp_size {tp_size}."
+            )
+        elif (
+            self.total_num_kv_heads < tp_size and tp_size % self.total_num_kv_heads != 0
+        ):
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel ranks.
+            raise ValueError(
+                f"Number of KV heads is less than TP size, but tp_size {tp_size} "
+                f"is not divisible by total_num_kv_heads {self.total_num_kv_heads}."
+            )
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.qk_nope_dim = getattr(config, "qk_nope_dim", None)
+        self.qk_rope_dim = getattr(config, "qk_rope_dim", None)
+        self.v_channels = getattr(config, "v_channels", None)
+        self.head_dim = self.qk_rope_dim + self.qk_nope_dim
+        self.q_size = self.num_heads * self.head_dim
+        self.k_size = self.num_kv_heads * self.head_dim
+        self.v_size = self.num_kv_heads * self.v_channels
+        self.scaling = self.head_dim**-0.5
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+
+        self.param_sink_number = getattr(config, "param_sink_number", 0)
+        self.param_sink_with_value = getattr(config, "param_sink_with_value", False)
+        self.param_sink_scalar = getattr(config, "param_sink_scalar", None)
+        self.param_sink_of_head_num = getattr(config, "param_sink_of_head_dim", False)
+
+        self.qkv_proj = MergedColumnParallelLinear(
+            hidden_size=hidden_size,
+            output_sizes=[
+                self.q_size * tp_size,
+                self.k_size * tp_size,
+                self.v_size * tp_size,
+            ],
+            bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
+        )
+
+        self.o_proj = RowParallelLinear(
+            input_size=self.total_num_heads * self.v_channels,
+            output_size=hidden_size,
+            bias=bias_o_proj,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+
+        self.k_layernorm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        self._init_rotary_emb(
+            config, rope_scaling=rope_scaling, quant_config=quant_config
+        )
+
+        if hasattr(config, "interleaved_sliding_window"):
+            interleaved_sliding_window = config.interleaved_sliding_window
+            if isinstance(interleaved_sliding_window, int):
+                sliding_window = interleaved_sliding_window
+            elif isinstance(interleaved_sliding_window, list):
+                sw_idx = layer_idx % len(interleaved_sliding_window)
+                sliding_window = interleaved_sliding_window[sw_idx]
+            else:
+                raise ValueError(
+                    f"{type(interleaved_sliding_window)} "
+                    "for interleaved_sliding_window is not supported."
+                )
+        else:
+            sliding_window = None
+
+        # self.attn = Attention(
+        #     self.num_heads,
+        #     self.head_dim,
+        #     self.scaling,
+        #     num_kv_heads=self.num_kv_heads,
+        #     cache_config=cache_config,
+        #     quant_config=quant_config,
+        #     per_layer_sliding_window=sliding_window,
+        #     attn_type=attn_type,
+        #     prefix=f"{prefix}.attn",
+        # )
+
+        self.attn = AttentionWithSink(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            per_layer_sliding_window=sliding_window,
+            attn_type=attn_type,
+            prefix=f"{prefix}.attn",
+        )
+
+        if self.param_sink_number > 0:
+            self.param_sink_query = torch.zeros(
+                (self.param_sink_number, self.num_heads, self.head_dim),
+                device=torch.cuda.current_device(),
+                dtype=config.torch_type,
+            )
+            if self.param_sink_of_head_num:
+                self.param_sink_num_heads_per_partion = self.num_heads
+                self.q_mult = divide(self.num_heads, self.num_kv_heads)
+            else:
+                self.param_sink_num_heads_per_partion = self.num_kv_heads
+            if self.param_sink_scalar:
+                self.param_sink_key_zero_pad = torch.zeros(
+                    (
+                        self.param_sink_number,
+                        self.param_sink_num_heads_per_partion,
+                        self.param_sink_scalar - 1,
+                    ),
+                    device=torch.cuda.current_device(),
+                    dtype=config.torch_dtype,
+                )
+                self.param_sink_key = torch.nn.Parameter(
+                    torch.empty(
+                        (self.param_sink_number, self.param_sink_num_heads_per_partion),
+                        device=torch.cuda.current_device(),
+                        dtype=config.torch_dtype,
+                    )
+                )
+            else:
+                self.param_sink_key = torch.nn.Parameter(
+                    torch.empty(
+                        (
+                            self.param_sink_number,
+                            self.param_sink_num_heads_per_partion,
+                            self.head_dim,
+                        ),
+                        device=torch.cuda.current_device(),
+                        dtype=config.torch_dtype,
+                    )
+                )
+            # setattr(self.param_sink_key, 'allreduce', True)
+
+            if self.param_sink_with_value:
+                self.param_sink_value = torch.nn.Parameter(
+                    torch.empty(
+                        (
+                            self.param_sink_number,
+                            self.param_sink_num_heads_per_partion,
+                            self.v_channels,
+                        ),
+                        device=torch.cuda.current_device(),
+                        dtype=config.torch_dtype,
+                    )
+                )
+                # setattr(self.param_sink_value, 'allreduce', True)
+            else:
+                self.param_sink_value = torch.zeros(
+                    torch.empty(
+                        (
+                            self.param_sink_number,
+                            self.param_sink_num_heads_per_partion,
+                            self.v_channels,
+                        ),
+                        device=torch.cuda.current_device(),
+                        dtype=config.torch_dtype,
+                    )
+                )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        k = self.k_layernorm(k.view(-1, self.num_kv_heads, self.head_dim))
+        q, k = self.rotary_emb(positions, q, k)
+
+        q = q.view(-1, self.q_size)
+        k = k.view(-1, self.k_size)
+        param_sink_key = self.param_sink_key
+        if (
+            self.param_sink_number > 0
+            and hasattr(self, "k_layernorm")
+            and self.k_layernorm is not None
+        ):
+            param_sink_key = self.k_layernorm(param_sink_key)
+
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            **(
+                dict(
+                    sink_query=self.param_sink_query,
+                    sink_key=param_sink_key,
+                    sink_value=self.param_sink_value,
+                    v_head_size=self.v_channels,
+                )
+                if self.param_sink_number > 0
+                else {}
+            ),
+        )
+        attn_output = attn_output.reshape(-1, self.num_heads * self.v_channels)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _init_rotary_emb(
+        self,
+        config: PretrainedConfig,
+        rope_scaling: dict[str, Any] | None,
+        quant_config: QuantizationConfig | None,
+    ) -> None:
+        is_neox_style = True
+        is_gguf = quant_config and quant_config.get_name() == "gguf"
+        if is_gguf and config.model_type == "PanguEmbedded":
+            is_neox_style = False
+
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.qk_rope_dim,
             max_position=self.max_position_embeddings,
             base=self.rope_theta,
             rope_scaling=rope_scaling,

@@ -916,6 +916,10 @@ def unified_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     layer_name: str,
+    sink_query: torch.Tensor | None,
+    sink_key: torch.Tensor | None,
+    sink_value: torch.Tensor | None,
+    v_head_size: int | None,
 ) -> torch.Tensor:
     wait_for_kv_layer_from_connector(layer_name)
 
@@ -925,6 +929,42 @@ def unified_attention(
         attn_metadata = attn_metadata[layer_name]
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
+
+    # Only cat sink tokens in prefill
+    if (
+        attn_metadata.max_query_len > 1
+        and sink_key is not None
+        and sink_value is not None
+    ):
+        cu_seqlens_q = attn_metadata.query_start_loc
+        key_list = []
+        value_list = []
+        bsz = cu_seqlens_q.shape[0] - 1
+        for i in range(bsz):
+            k = key[cu_seqlens_q[i] : cu_seqlens_q[i + 1]]
+            v = value[cu_seqlens_q[i] : cu_seqlens_q[i + 1]]
+            key_list.append(torch.cat([sink_key, k], dim=0))
+            value_list.append(torch.cat([sink_value, v], dim=0))
+        key = torch.cat(key_list, dim=0)
+        value = torch.cat(value_list, dim=0)
+
+        seq_lens_with_sink = attn_metadata.seq_lens + sink_value.shape[0]
+        cu_seqlen = [0] + seq_lens_with_sink.tolist()
+        cu_seqlen = torch.tensor(cu_seqlen, device=torch.cuda.current_device())
+        cu_seqlen = torch.cumsum(cu_seqlen, dim=0)[1:]
+
+        attn_metadata.num_actual_tokens = (
+            attn_metadata.num_actual_tokens + bsz * sink_value.shape[0]
+        )
+        attn_metadata.max_query_len = attn_metadata.max_query_len + sink_value.shape[0]
+        attn_metadata.query_start_loc = attn_metadata.query_start_loc + torch.tensor(
+            list(range(0, (bsz + 1) * sink_value.shape[0], sink_value.shape[0])),
+            attn_metadata.query_start_loc,
+            torch.cuda.current_device(),
+        )
+        attn_metadata.max_seq_len = attn_metadata.max_seq_len + sink_value.shape[0]
+        attn_metadata.seq_lens = seq_lens_with_sink
+
     output = self.impl.forward(self, query, key, value, kv_cache, attn_metadata)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
@@ -936,8 +976,19 @@ def unified_attention_fake(
     key: torch.Tensor,
     value: torch.Tensor,
     layer_name: str,
+    sink_query: torch.Tensor | None = None,
+    sink_key: torch.Tensor | None = None,
+    sink_value: torch.Tensor | None = None,
+    v_head_size: int | None = None,
 ) -> torch.Tensor:
-    return torch.empty_like(query).contiguous()
+    if v_head_size is None:
+        return torch.empty_like(query).contiguous()
+    else:
+        output_shape = query.shape
+        output_shape[-1] = v_head_size
+        return torch.empty(
+            output_shape, dtype=query.dtype, device=query.device
+        ).contiguous()
 
 
 direct_register_custom_op(
