@@ -320,7 +320,8 @@ class StaticSinkMLAAttention(MLAAttention):
             self.sliding_window,
         )
         if self.sliding_window is not None:
-            assert not self.use_sparse and self.indexer is None  # TODO(runze): debug only, remove later
+             # TODO(runze): debug only, remove later
+            assert not self.use_sparse and self.indexer is None
             return SlidingWindowMLASpec(
                 block_size=vllm_config.cache_config.block_size,
                 num_kv_heads=1,
@@ -332,7 +333,8 @@ class StaticSinkMLAAttention(MLAAttention):
                 alignment=576,
             )
         # TODO(runze): debug only, remove later
-        assert self.use_sparse and self.indexer is not None, f"If sliding window is None, should use DSA"
+        assert self.use_sparse and self.indexer is not None, \
+            f"If sliding window is None, should use DSA"
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,

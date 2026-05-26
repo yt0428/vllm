@@ -40,7 +40,8 @@ class MomeAttentionMetadataBuilder(BaseMambaAttentionMetadataBuilder):
         self.num_spec_tokens: int = vllm_config.num_speculative_tokens
         self.use_spec_decode = self.num_spec_tokens > 0
 
-        # FIXME(runze): this is the only difference from the parent class, think of a better way
+        # FIXME(runze): this is the only difference
+        # from the parent class, think of a better way
         assert isinstance(kv_cache_spec, SlidingWindowMomeSpec)
         scheduler_config = vllm_config.scheduler_config
         self.decode_cudagraph_max_bs: int = scheduler_config.max_num_seqs

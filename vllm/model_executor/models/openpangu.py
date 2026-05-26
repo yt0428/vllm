@@ -243,7 +243,8 @@ class MomeAttention(MambaBase, CustomOp):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
-        # FIXME(runze): block_size and sliding_window are hardcoded to be 8 now; make it general later
+        # FIXME(runze): block_size and sliding_window are
+        # hardcoded to be 8 now;make it general later
         return SlidingWindowMomeSpec(
             block_size=8,
             num_kv_heads=1,
