@@ -166,7 +166,6 @@ class MomeAttention(MambaBase, CustomOp):
         num_spec_tokens: int,
         q_lora_rank: int,
         kv_lora_rank: int,
-        num_heads: int,
         num_local_heads: int,
         v_head_dim: int,
         vllm_config: VllmConfig,
@@ -178,12 +177,10 @@ class MomeAttention(MambaBase, CustomOp):
         self.dtype = vllm_config.model_config.dtype
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
-        self.num_heads = num_heads
         self.num_local_heads = num_local_heads
         self.v_head_dim = v_head_dim
         self.o_dim = num_local_heads * v_head_dim
-        self.cache_o_dim = num_heads * v_head_dim
-        self.cache_head_size = q_lora_rank + kv_lora_rank + self.cache_o_dim
+        self.cache_head_size = q_lora_rank + kv_lora_rank + self.o_dim
         self.prefix = prefix
         self.kv_cache_dtype = vllm_config.cache_config.cache_dtype
 
@@ -255,7 +252,7 @@ class MomeAttention(MambaBase, CustomOp):
             sliding_window=8,
             cache_dtype_str=vllm_config.cache_config.cache_dtype,
             alignment=576,
-            component_dims=(self.q_lora_rank, self.kv_lora_rank, self.cache_o_dim)
+            component_dims=(self.q_lora_rank, self.kv_lora_rank, self.o_dim)
         )
 
     def get_attn_backend(self) -> type:
@@ -1112,7 +1109,6 @@ class OpenPanguMLAAttention(PanguSinkAttentionBase, nn.Module):
                 num_spec_tokens=spec_token_num,
                 q_lora_rank=self.q_lora_rank,
                 kv_lora_rank=self.kv_lora_rank,
-                num_heads=self.num_heads,
                 num_local_heads=self.num_local_heads,
                 v_head_dim=self.v_head_dim,
                 vllm_config=vllm_config,
