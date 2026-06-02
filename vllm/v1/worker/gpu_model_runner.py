@@ -21,6 +21,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+from vllm._agent_debug import agent_log, agent_rank
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -130,6 +131,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.mome_attn import MomeAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     create_fast_prefill_custom_backend,
@@ -2347,7 +2349,12 @@ class GPUModelRunner(
 
             extra_attn_metadata_args = {}
             if use_spec_decode and isinstance(
-                builder, (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder)
+                builder,
+                (
+                    Mamba2AttentionMetadataBuilder,
+                    GDNAttentionMetadataBuilder,
+                    MomeAttentionMetadataBuilder,
+                ),
             ):
                 assert ubid is None, "UBatching not supported with GDN yet"
                 extra_attn_metadata_args = dict(
@@ -2426,13 +2433,21 @@ class GPUModelRunner(
                 ):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
+                elif hasattr(self.drafter, "has_draft_kv_cache_group"):
+                    if self.drafter.has_draft_kv_cache_group(kv_cache_gid):
+                        spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
-            # Capture per-group block tables for multi-group proposers.
-            if self.speculative_config and isinstance(self.drafter, Gemma4Proposer):
+            if self.speculative_config and hasattr(
+                self.drafter, "set_per_group_block_table"
+            ):
                 self.drafter.set_per_group_block_table(
                     kv_cache_gid, cm.block_table_tensor
                 )
+                if hasattr(self.drafter, "set_per_group_slot_mapping"):
+                    self.drafter.set_per_group_slot_mapping(
+                        kv_cache_gid, cm.slot_mapping
+                    )
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:
@@ -4265,6 +4280,19 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
+                # #region agent log
+                agent_log(
+                    "H6",
+                    "gpu_model_runner.py:execute_model",
+                    "before compute_logits",
+                    {
+                        "rank": agent_rank(),
+                        "num_tokens_padded": int(num_tokens_padded),
+                        "num_logits": int(sample_hidden_states.shape[0]),
+                        "logits_numel": int(sample_hidden_states.numel()),
+                    },
+                )
+                # #endregion
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
@@ -4315,12 +4343,37 @@ class GPUModelRunner(
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
+        # #region agent log
+        agent_log(
+            "H2",
+            "gpu_model_runner.py:execute_model",
+            "execute_model done",
+            {
+                "rank": agent_rank(),
+                "num_reqs": int(num_reqs),
+                "num_tokens_padded": int(num_tokens_padded),
+                "cudagraph_mode": str(cudagraph_mode),
+            },
+        )
+        # #endregion
+
         return None
 
     @torch.inference_mode
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        # #region agent log
+        agent_log(
+            "H2",
+            "gpu_model_runner.py:sample_tokens",
+            "sample_tokens enter",
+            {
+                "rank": agent_rank(),
+                "has_execute_state": self.execute_model_state is not None,
+            },
+        )
+        # #endregion
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
@@ -4363,6 +4416,19 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        # #region agent log
+        agent_log(
+            "H2",
+            "gpu_model_runner.py:sample_tokens",
+            "after _sample",
+            {
+                "rank": agent_rank(),
+                "num_reqs": int(self.input_batch.num_reqs),
+                "total_scheduled": int(scheduler_output.total_num_scheduled_tokens),
+            },
+        )
+        # #endregion
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4426,7 +4492,26 @@ class GPUModelRunner(
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
+                    # #region agent log
+                    agent_log(
+                        "H3",
+                        "gpu_model_runner.py:sample_tokens",
+                        "before propose_draft_token_ids (eagle path)",
+                        {
+                            "rank": agent_rank(),
+                            "num_reqs": int(self.input_batch.num_reqs),
+                        },
+                    )
+                    # #endregion
                     propose_draft_token_ids(sampled_token_ids)
+                    # #region agent log
+                    agent_log(
+                        "H3",
+                        "gpu_model_runner.py:sample_tokens",
+                        "after propose_draft_token_ids (eagle path)",
+                        {"rank": agent_rank()},
+                    )
+                    # #endregion
                 elif self.valid_sampled_token_count_event is not None:
                     assert spec_decode_common_attn_metadata is not None
                     next_token_ids, valid_sampled_tokens_count = (
@@ -4495,10 +4580,35 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
             )
 
+        # #region agent log
+        agent_log(
+            "H4",
+            "gpu_model_runner.py:sample_tokens",
+            "after _bookkeeping_sync",
+            {"rank": agent_rank()},
+        )
+        # #endregion
+
         if propose_drafts_after_bookkeeping:
+            # #region agent log
+            agent_log(
+                "H3",
+                "gpu_model_runner.py:sample_tokens",
+                "before propose_draft_token_ids (after bookkeeping)",
+                {"rank": agent_rank(), "num_reqs": int(self.input_batch.num_reqs)},
+            )
+            # #endregion
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
+            # #region agent log
+            agent_log(
+                "H3",
+                "gpu_model_runner.py:sample_tokens",
+                "after propose_draft_token_ids (after bookkeeping)",
+                {"rank": agent_rank()},
+            )
+            # #endregion
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
@@ -4892,6 +5002,12 @@ class GPUModelRunner(
                 self.drafter,
                 EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
             )
+
+            num_reqs = self.input_batch.num_reqs
+            if hasattr(self.drafter, "set_draft_num_accepted_tokens"):
+                self.drafter.set_draft_num_accepted_tokens(
+                    self.num_accepted_tokens.gpu[:num_reqs]
+                )
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be

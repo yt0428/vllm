@@ -311,12 +311,18 @@ def mome_attention_fused_op(
     layer_name: str,
     output: torch.Tensor,
 ) -> None:
+    from vllm._agent_debug import agent_log, agent_rank
+
     forward_context = get_forward_context()
     if forward_context.attn_metadata is None:
         output.fill_(0)
         return
 
     hidden_states = hidden_states.contiguous()
+    # FULL CUDA graph pads batch tokens; only num_actual_tokens are processed by
+    # decode/prefill kernels. Initialize output from input so padded tail tokens
+    # are not left uninitialized (garbage can hang later layers / NCCL collectives).
+    output.copy_(hidden_states)
     conv_state_ = conv_state.transpose(-1, -2)
     mome_metadata = forward_context.attn_metadata[layer_name]
     num_decode_tokens = mome_metadata.num_decode_tokens
@@ -324,8 +330,31 @@ def mome_attention_fused_op(
     num_actual_tokens = num_decode_tokens + num_prefill_tokens
     num_decodes = mome_metadata.num_decodes
     num_prefills = mome_metadata.num_prefills
+    # #region agent log
+    if "layers.0" in layer_name and "mome_attn" in layer_name:
+        qsl_end = None
+        if mome_metadata.query_start_loc_d is not None:
+            qsl_end = int(mome_metadata.query_start_loc_d[-1].item())
+        agent_log(
+            "H1",
+            "openpangu.py:mome_attention_fused_op",
+            "mome fused op enter",
+            {
+                "rank": agent_rank(),
+                "layer": layer_name,
+                "hidden_tokens": int(hidden_states.shape[0]),
+                "ctx_num_tokens": int(forward_context.num_tokens or -1),
+                "num_decode_tokens": int(num_decode_tokens),
+                "num_decodes": int(num_decodes),
+                "qsl_end": qsl_end,
+                "token_mismatch": (
+                    qsl_end is not None and int(num_decode_tokens) != qsl_end
+                ),
+            },
+        )
+    # #endregion
     if num_decodes > 0:
-        decode_hidden_states = hidden_states[:num_decodes].clone()
+        decode_hidden_states = hidden_states[:num_decode_tokens].clone()
         decode_state_indices = mome_metadata.state_indices_tensor_d
         decode_block_idx_last_scheduled_token = (
             mome_metadata.block_idx_last_scheduled_token_d
@@ -333,22 +362,49 @@ def mome_attention_fused_op(
         decode_block_idx_last_computed_token = (
             mome_metadata.block_idx_last_computed_token_d
         )
+        query_start_loc_d = mome_metadata.query_start_loc_d
+        num_accepted_tokens = mome_metadata.num_accepted_tokens
         assert decode_state_indices is not None
         assert decode_block_idx_last_scheduled_token is not None
         assert decode_block_idx_last_computed_token is not None
-        decode_output = causal_conv1d_update(
-            decode_hidden_states,
-            conv_state_,
-            conv_weight,
-            bias=None,
-            activation=None,
-            conv_state_indices=decode_state_indices[:num_decodes].contiguous(),
-            block_idx_last_scheduled_token=(
-                decode_block_idx_last_scheduled_token[:num_decodes]
-            ),
-            initial_state_idx=decode_block_idx_last_computed_token[:num_decodes],
-        )
+        if query_start_loc_d is not None and num_accepted_tokens is not None:
+            assert mome_metadata.max_decode_query_len is not None
+            decode_output = causal_conv1d_update(
+                decode_hidden_states,
+                conv_state_,
+                conv_weight,
+                bias=None,
+                activation=None,
+                conv_state_indices=decode_state_indices.contiguous(),
+                block_idx_last_scheduled_token=decode_block_idx_last_scheduled_token,
+                initial_state_idx=decode_block_idx_last_computed_token,
+                num_accepted_tokens=num_accepted_tokens,
+                query_start_loc=query_start_loc_d,
+                max_query_len=mome_metadata.max_decode_query_len,
+            )
+        else:
+            decode_output = causal_conv1d_update(
+                decode_hidden_states,
+                conv_state_,
+                conv_weight,
+                bias=None,
+                activation=None,
+                conv_state_indices=decode_state_indices[:num_decodes].contiguous(),
+                block_idx_last_scheduled_token=(
+                    decode_block_idx_last_scheduled_token[:num_decodes]
+                ),
+                initial_state_idx=decode_block_idx_last_computed_token[:num_decodes],
+            )
         output[:num_decode_tokens] = decode_output
+        # #region agent log
+        if "layers.0" in layer_name and "mome_attn" in layer_name:
+            agent_log(
+                "H5",
+                "openpangu.py:mome_attention_fused_op",
+                "mome fused op decode done",
+                {"rank": agent_rank(), "layer": layer_name},
+            )
+        # #endregion
 
     num_prefills = mome_metadata.num_prefills
     if num_prefills > 0:
