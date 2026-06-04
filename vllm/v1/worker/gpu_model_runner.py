@@ -130,6 +130,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.mome_attn import MomeAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     create_fast_prefill_custom_backend,
@@ -2347,7 +2348,12 @@ class GPUModelRunner(
 
             extra_attn_metadata_args = {}
             if use_spec_decode and isinstance(
-                builder, (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder)
+                builder,
+                (
+                    Mamba2AttentionMetadataBuilder,
+                    GDNAttentionMetadataBuilder,
+                    MomeAttentionMetadataBuilder,
+                ),
             ):
                 assert ubid is None, "UBatching not supported with GDN yet"
                 extra_attn_metadata_args = dict(
@@ -2426,13 +2432,21 @@ class GPUModelRunner(
                 ):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
+                elif hasattr(self.drafter, "has_draft_kv_cache_group"):
+                    if self.drafter.has_draft_kv_cache_group(kv_cache_gid):
+                        spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
-            # Capture per-group block tables for multi-group proposers.
-            if self.speculative_config and isinstance(self.drafter, Gemma4Proposer):
+            if self.speculative_config and hasattr(
+                self.drafter, "set_per_group_block_table"
+            ):
                 self.drafter.set_per_group_block_table(
                     kv_cache_gid, cm.block_table_tensor
                 )
+                if hasattr(self.drafter, "set_per_group_slot_mapping"):
+                    self.drafter.set_per_group_slot_mapping(
+                        kv_cache_gid, cm.slot_mapping
+                    )
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:
@@ -4892,6 +4906,12 @@ class GPUModelRunner(
                 self.drafter,
                 EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
             )
+
+            num_reqs = self.input_batch.num_reqs
+            if hasattr(self.drafter, "set_draft_num_accepted_tokens"):
+                self.drafter.set_draft_num_accepted_tokens(
+                    self.num_accepted_tokens.gpu[:num_reqs]
+                )
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
