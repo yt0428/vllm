@@ -268,6 +268,8 @@ class ModelArchConfigConvertorBase:
             "pangu_ultra_moe",
             "pangu_ultra_moe_mtp",
             "bailing_hybrid",
+            "openpangu_v2",
+            "openpangu_mtp",
         ):
             # check is deepseek_v4 model
             if hasattr(self.hf_text_config, "compress_ratios"):
@@ -577,6 +579,11 @@ class Gemma4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
         return max(head_dim, global_head_dim) or super().get_head_size()
 
 
+class OpenpanguMTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    def get_num_hidden_layers(self) -> int:
+        return getattr(self.hf_text_config, "num_nextn_predict_layers", 0)
+
+
 # hf_config.model_type -> convertor class
 MODEL_ARCH_CONFIG_CONVERTORS = {
     "cohere_asr": CohereAsrModelArchConfigConvertor,
@@ -604,6 +611,7 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
     "mpt": MPTModelArchConfigConvertor,
     "nemotron-nas": NemotronNasModelArchConfigConvertor,
     "pangu_ultra_moe_mtp": PanguUltraMoeMTPModelArchConfigConvertor,
+    "openpangu_mtp": OpenpanguMTPModelArchConfigConvertor,
     "qwen3_5_mtp": Qwen3_5MTPModelArchConfigConvertor,
     "qwen3_next_mtp": Qwen3NextMTPModelArchConfigConvertor,
     "RefinedWeb": FalconModelArchConfigConvertor,

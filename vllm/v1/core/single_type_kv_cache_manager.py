@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
+    SlidingWindowMomeSpec,
     SlidingWindowSpec,
     TQFullAttentionSpec,
 )
@@ -1363,6 +1364,11 @@ def register_all_kvcache_specs(vllm_config):
         SlidingWindowMLASpec,
         SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowMLASpec,
+    )
+    KVCacheSpecRegistry.register(
+        SlidingWindowMomeSpec,
+        SlidingWindowManager,
+        uniform_type_base_spec=SlidingWindowMomeSpec,
     )
 
     KVCacheSpecRegistry.register(

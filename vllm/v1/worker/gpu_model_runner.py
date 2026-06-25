@@ -131,6 +131,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.mome_attn import MomeAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     create_fast_prefill_custom_backend,
@@ -149,6 +150,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
+    SlidingWindowMomeSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -2393,7 +2395,12 @@ class GPUModelRunner(
 
             extra_attn_metadata_args = {}
             if use_spec_decode and isinstance(
-                builder, (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder)
+                builder,
+                (
+                    Mamba2AttentionMetadataBuilder,
+                    GDNAttentionMetadataBuilder,
+                    MomeAttentionMetadataBuilder,
+                ),
             ):
                 assert ubid is None, "UBatching not supported with GDN yet"
                 extra_attn_metadata_args = dict(
@@ -2408,6 +2415,10 @@ class GPUModelRunner(
                 ):
                     extra_attn_metadata_args["prev_last_scheduled_idx"] = (
                         self.mamba_prev_last_scheduled_idx.gpu[:num_reqs_padded]
+                    )
+                if isinstance(builder, MomeAttentionMetadataBuilder):
+                    extra_attn_metadata_args["num_prompt_tokens"] = (
+                        self.input_batch.num_prompt_tokens_cpu_tensor[:num_reqs_padded]
                     )
 
             if for_cudagraph_capture:
@@ -7083,7 +7094,9 @@ class GPUModelRunner(
                 raw_tensor = kv_cache_raw_tensors[layer_name]
                 assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
                 num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
-                if isinstance(kv_cache_spec, AttentionSpec):
+                if isinstance(kv_cache_spec, AttentionSpec) and not isinstance(
+                    kv_cache_spec, SlidingWindowMomeSpec
+                ):
                     has_attn = True
                     num_blocks_per_kv_block = (
                         kv_cache_spec.block_size // kernel_block_size
@@ -7147,7 +7160,7 @@ class GPUModelRunner(
                         kv_cache = raw_tensor.view(kv_cache_shape)
                     kv_caches[layer_name] = kv_cache.permute(*inv_order)
 
-                elif isinstance(kv_cache_spec, MambaSpec):
+                elif isinstance(kv_cache_spec, (MambaSpec, SlidingWindowMomeSpec)):
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     state_tensors = []
@@ -7193,7 +7206,9 @@ class GPUModelRunner(
 
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
-            if not isinstance(kv_cache_spec, AttentionSpec):
+            if not isinstance(kv_cache_spec, AttentionSpec) or isinstance(
+                kv_cache_spec, SlidingWindowMomeSpec
+            ):
                 continue
             block_dim = group.backend.get_kv_cache_block_dim(
                 kernel_block_sizes[group.kv_cache_group_id],
