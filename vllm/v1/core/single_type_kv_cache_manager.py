@@ -21,7 +21,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
-    SlidingWindowMomeSpec,
+    SlidingWindowModAttnSpec,
     SlidingWindowSpec,
     TQFullAttentionSpec,
 )
@@ -1341,9 +1341,9 @@ def register_all_kvcache_specs(vllm_config):
         uniform_type_base_spec=SlidingWindowMLASpec,
     )
     KVCacheSpecRegistry.register(
-        SlidingWindowMomeSpec,
+        SlidingWindowModAttnSpec,
         SlidingWindowManager,
-        uniform_type_base_spec=SlidingWindowMomeSpec,
+        uniform_type_base_spec=SlidingWindowModAttnSpec,
     )
 
     KVCacheSpecRegistry.register(

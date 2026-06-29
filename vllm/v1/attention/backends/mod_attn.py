@@ -19,11 +19,11 @@ from vllm.v1.attention.backends.utils import (
     compute_causal_conv1d_metadata,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, SlidingWindowMomeSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, SlidingWindowModAttnSpec
 
 
 @dataclass
-class MomeAttentionMetadata:
+class ModAttnAttentionMetadata:
     num_prefills: int
     num_prefill_tokens: int
     num_decodes: int
@@ -53,13 +53,15 @@ class MomeAttentionMetadata:
     max_decode_query_len: int | None = None
 
 
-class MomeAttentionMetadataBuilder(AttentionMetadataBuilder[MomeAttentionMetadata]):
-    """Metadata builder for MoME short-conv states.
+class ModAttnAttentionMetadataBuilder(
+    AttentionMetadataBuilder[ModAttnAttentionMetadata]
+):
+    """Metadata builder for ModAttn short-conv states.
 
-    MoME uses the SlidingWindowManager for cache ownership, but its causal
+    ModAttn uses the SlidingWindowManager for cache ownership, but its causal
     convolution kernels need explicit read/write block offsets. This builder
     intentionally does not inherit the Mamba builder because Mamba cache modes
-    collapse the block table in ways that are not valid for sliding-window MoME
+    collapse the block table in ways that are not valid for sliding-window ModAttn
     state.
     """
 
@@ -74,7 +76,7 @@ class MomeAttentionMetadataBuilder(AttentionMetadataBuilder[MomeAttentionMetadat
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        assert isinstance(kv_cache_spec, SlidingWindowMomeSpec)
+        assert isinstance(kv_cache_spec, SlidingWindowModAttnSpec)
 
         self.speculative_config = vllm_config.speculative_config
         self.compilation_config = vllm_config.compilation_config
@@ -125,7 +127,7 @@ class MomeAttentionMetadataBuilder(AttentionMetadataBuilder[MomeAttentionMetadat
         self,
         common_attn_metadata: CommonAttentionMetadata,
         draft_index: int,
-    ) -> MomeAttentionMetadata:
+    ) -> ModAttnAttentionMetadata:
         del draft_index
         common_attn_metadata = self._treat_single_token_prefills_as_decodes(
             common_attn_metadata
@@ -138,13 +140,13 @@ class MomeAttentionMetadataBuilder(AttentionMetadataBuilder[MomeAttentionMetadat
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
-    ) -> MomeAttentionMetadata:
+    ) -> ModAttnAttentionMetadata:
         m = common_attn_metadata
         assert (
             m.max_query_len <= 1 + self.num_spec_tokens
             and m.num_reqs <= self.decode_cudagraph_max_bs
         ), (
-            "MoME only supports decode-only full CUDAGraph capture. "
+            "ModAttn only supports decode-only full CUDAGraph capture. "
             "Make sure all cudagraph capture sizes <= max_num_seq."
         )
         assert m.max_query_len == 1 + self.num_spec_tokens  # decode-only
@@ -169,7 +171,7 @@ class MomeAttentionMetadataBuilder(AttentionMetadataBuilder[MomeAttentionMetadat
         num_accepted_tokens: torch.Tensor | None = None,
         num_prompt_tokens: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> MomeAttentionMetadata:
+    ) -> ModAttnAttentionMetadata:
         del common_prefix_len, fast_build, kwargs
         common_attn_metadata = self._treat_single_token_prefills_as_decodes(
             common_attn_metadata
@@ -232,7 +234,7 @@ class MomeAttentionMetadataBuilder(AttentionMetadataBuilder[MomeAttentionMetadat
         num_accepted_tokens: torch.Tensor | None = None,
         num_prompt_tokens: torch.Tensor | None = None,
         require_uniform: bool = False,
-    ) -> MomeAttentionMetadata:
+    ) -> ModAttnAttentionMetadata:
         if num_accepted_tokens is not None:
             assert self.reorder_batch_threshold is not None
             decode_threshold = self.reorder_batch_threshold
@@ -346,7 +348,7 @@ class MomeAttentionMetadataBuilder(AttentionMetadataBuilder[MomeAttentionMetadat
                 )
             )
 
-        metadata = MomeAttentionMetadata(
+        metadata = ModAttnAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
@@ -373,8 +375,8 @@ class MomeAttentionMetadataBuilder(AttentionMetadataBuilder[MomeAttentionMetadat
         return self._update_metadata_for_cudagraph_capture(metadata)
 
     def _update_metadata_for_cudagraph_capture(
-        self, metadata: MomeAttentionMetadata
-    ) -> MomeAttentionMetadata:
+        self, metadata: ModAttnAttentionMetadata
+    ) -> ModAttnAttentionMetadata:
         if not (
             metadata.num_prefills == 0
             and metadata.num_decodes <= self.decode_cudagraph_max_bs
@@ -387,7 +389,7 @@ class MomeAttentionMetadataBuilder(AttentionMetadataBuilder[MomeAttentionMetadat
         assert state_indices_tensor_d is not None
         num_cols = state_indices_tensor_d.shape[1]
         assert num_cols <= self.state_indices_tensor_d.shape[1], (
-            "MoME decode block table is wider than the cudagraph buffer: "
+            "ModAttn decode block table is wider than the cudagraph buffer: "
             f"{num_cols} > {self.state_indices_tensor_d.shape[1]}."
         )
 
@@ -442,10 +444,10 @@ class MomeAttentionMetadataBuilder(AttentionMetadataBuilder[MomeAttentionMetadat
 
     def update_block_table(
         self,
-        metadata: MomeAttentionMetadata,
+        metadata: ModAttnAttentionMetadata,
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor,
-    ) -> MomeAttentionMetadata:
+    ) -> ModAttnAttentionMetadata:
         del slot_mapping
         state_indices_tensor = blk_table
         if state_indices_tensor.dim() == 1:
@@ -456,7 +458,7 @@ class MomeAttentionMetadataBuilder(AttentionMetadataBuilder[MomeAttentionMetadat
             metadata.num_prefills + metadata.num_decodes
             == state_indices_tensor.shape[0]
         ), (
-            "Mismatch in number of requests when updating MoME block table."
+            "Mismatch in number of requests when updating ModAttn block table."
             f" Expected {metadata.num_prefills + metadata.num_decodes}, "
             f"got {state_indices_tensor.shape[0]}."
         )
@@ -474,7 +476,7 @@ class MomeAttentionMetadataBuilder(AttentionMetadataBuilder[MomeAttentionMetadat
         return self._update_metadata_for_cudagraph_capture(new_metadata)
 
 
-class MomeAttentionBackend(AttentionBackend):
+class ModAttnAttentionBackend(AttentionBackend):
     @staticmethod
-    def get_builder_cls() -> type["MomeAttentionMetadataBuilder"]:
-        return MomeAttentionMetadataBuilder
+    def get_builder_cls() -> type["ModAttnAttentionMetadataBuilder"]:
+        return ModAttnAttentionMetadataBuilder

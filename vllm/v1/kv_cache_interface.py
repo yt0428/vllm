@@ -645,7 +645,7 @@ class MambaSpec(KVCacheSpec):
 
 
 @dataclass(frozen=True)
-class SlidingWindowMomeSpec(SlidingWindowMLASpec):
+class SlidingWindowModAttnSpec(SlidingWindowMLASpec):
     component_dims: tuple[int, ...] = ()
 
     @property
@@ -665,7 +665,7 @@ class SlidingWindowMomeSpec(SlidingWindowMLASpec):
         self, kv_cache_specs: dict[str, KVCacheSpec]
     ) -> bool:
         return all(
-            isinstance(spec, SlidingWindowMomeSpec)
+            isinstance(spec, SlidingWindowModAttnSpec)
             and spec.sliding_window == self.sliding_window
             and spec.component_dims == self.component_dims
             for spec in kv_cache_specs.values()
@@ -675,12 +675,12 @@ class SlidingWindowMomeSpec(SlidingWindowMLASpec):
         super().__post_init__()
         if len(self.component_dims) != 3:
             raise ValueError(
-                "SlidingWindowMomeSpec expects three component dims "
+                "SlidingWindowModAttnSpec expects three component dims "
                 f"(q, compressed-kv, output), got {self.component_dims}."
             )
         if any(dim <= 0 for dim in self.component_dims):
             raise ValueError(
-                "SlidingWindowMomeSpec component dims must be positive, "
+                "SlidingWindowModAttnSpec component dims must be positive, "
                 f"got {self.component_dims}."
             )
 

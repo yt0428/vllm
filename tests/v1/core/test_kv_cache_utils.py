@@ -49,7 +49,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
-    SlidingWindowMomeSpec,
+    SlidingWindowModAttnSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
@@ -1922,13 +1922,13 @@ def new_mla_spec(cache_dtype_str=None):
     )
 
 
-def new_sliding_window_mome_spec(
+def new_sliding_window_mod_attn_spec(
     block_size=16,
     component_dims=(16, 32, 64),
     dtype=torch.float32,
     sliding_window=128,
 ):
-    return SlidingWindowMomeSpec(
+    return SlidingWindowModAttnSpec(
         block_size=block_size,
         num_kv_heads=1,
         head_size=sum(component_dims),
@@ -1938,8 +1938,8 @@ def new_sliding_window_mome_spec(
     )
 
 
-def test_sliding_window_mome_spec_cache_state_properties():
-    spec = new_sliding_window_mome_spec(
+def test_sliding_window_mod_attn_spec_cache_state_properties():
+    spec = new_sliding_window_mod_attn_spec(
         block_size=8,
         component_dims=(16, 32, 64),
         dtype=torch.bfloat16,
@@ -1959,9 +1959,9 @@ def test_sliding_window_mome_spec_cache_state_properties():
         ((16, -1, 64), "component dims must be positive"),
     ],
 )
-def test_sliding_window_mome_spec_validates_component_dims(component_dims, match):
+def test_sliding_window_mod_attn_spec_validates_component_dims(component_dims, match):
     with pytest.raises(ValueError, match=match):
-        new_sliding_window_mome_spec(component_dims=component_dims)
+        new_sliding_window_mod_attn_spec(component_dims=component_dims)
 
 
 def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():
@@ -1979,10 +1979,10 @@ def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():
         == KVCacheSpecKind.SLIDING_WINDOW_MLA
     )
 
-    # MoME short-conv states use a SlidingWindowMLASpec subclass so they should
+    # ModAttn short-conv states use a SlidingWindowMLASpec subclass so they should
     # stay in the sliding-window MLA family for scheduler-level classification.
     assert (
-        get_kv_cache_spec_kind(new_sliding_window_mome_spec())
+        get_kv_cache_spec_kind(new_sliding_window_mod_attn_spec())
         == KVCacheSpecKind.SLIDING_WINDOW_MLA
     )
 

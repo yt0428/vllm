@@ -8,12 +8,12 @@ import torch
 
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm.config.compilation import CUDAGraphMode
-from vllm.v1.attention.backends.mome_attn import (
-    MomeAttentionMetadata,
-    MomeAttentionMetadataBuilder,
+from vllm.v1.attention.backends.mod_attn import (
+    ModAttnAttentionMetadata,
+    ModAttnAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.kv_cache_interface import SlidingWindowMomeSpec
+from vllm.v1.kv_cache_interface import SlidingWindowModAttnSpec
 
 BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
@@ -45,8 +45,8 @@ def _make_vllm_config(
     )
 
 
-def _make_spec() -> SlidingWindowMomeSpec:
-    return SlidingWindowMomeSpec(
+def _make_spec() -> SlidingWindowModAttnSpec:
+    return SlidingWindowModAttnSpec(
         block_size=BLOCK_SIZE,
         num_kv_heads=1,
         head_size=112,
@@ -62,8 +62,8 @@ def _make_builder(
     max_num_seqs: int = 8,
     num_speculative_tokens: int = 0,
     cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-) -> MomeAttentionMetadataBuilder:
-    return MomeAttentionMetadataBuilder(
+) -> ModAttnAttentionMetadataBuilder:
+    return ModAttnAttentionMetadataBuilder(
         kv_cache_spec=_make_spec(),
         layer_names=["layer.0"],
         vllm_config=_make_vllm_config(
@@ -92,7 +92,7 @@ def _make_common(
     )
 
 
-def _build(builder: MomeAttentionMetadataBuilder, common, **kwargs):
+def _build(builder: ModAttnAttentionMetadataBuilder, common, **kwargs):
     return builder.build(
         common_prefix_len=0,
         common_attn_metadata=common,
@@ -100,7 +100,7 @@ def _build(builder: MomeAttentionMetadataBuilder, common, **kwargs):
     )
 
 
-def test_mome_build_decode_only_metadata():
+def test_mod_attn_build_decode_only_metadata():
     builder = _make_builder()
     common = _make_common(
         seq_lens=[17, 32, 1],
@@ -132,7 +132,7 @@ def test_mome_build_decode_only_metadata():
     assert metadata.has_initial_states_p is None
 
 
-def test_mome_build_prefill_only_metadata():
+def test_mod_attn_build_prefill_only_metadata():
     builder = _make_builder()
     common = _make_common(
         seq_lens=[8, 20],
@@ -168,7 +168,7 @@ def test_mome_build_prefill_only_metadata():
     assert metadata.token_chunk_offset_ptr is not None
 
 
-def test_mome_build_mixed_decode_and_prefill_metadata():
+def test_mod_attn_build_mixed_decode_and_prefill_metadata():
     builder = _make_builder()
     common = _make_common(
         seq_lens=[17, 32, 20],
@@ -212,7 +212,7 @@ def test_mome_build_mixed_decode_and_prefill_metadata():
     )
 
 
-def test_mome_treats_single_token_prefill_with_prior_state_as_decode():
+def test_mod_attn_treats_single_token_prefill_with_prior_state_as_decode():
     builder = _make_builder()
     common = _make_common(
         seq_lens=[8, 1],
@@ -238,7 +238,7 @@ def test_mome_treats_single_token_prefill_with_prior_state_as_decode():
     )
 
 
-def test_mome_spec_decode_updates_decode_metadata():
+def test_mod_attn_spec_decode_updates_decode_metadata():
     builder = _make_builder(num_speculative_tokens=2)
     common = _make_common(
         seq_lens=[19, 7],
@@ -268,7 +268,7 @@ def test_mome_spec_decode_updates_decode_metadata():
     )
 
 
-def test_mome_cudagraph_capture_pads_decode_metadata():
+def test_mod_attn_cudagraph_capture_pads_decode_metadata():
     builder = _make_builder(
         max_model_len=64,
         max_num_seqs=4,
@@ -276,7 +276,7 @@ def test_mome_cudagraph_capture_pads_decode_metadata():
         cudagraph_mode=CUDAGraphMode.FULL,
     )
     state_indices = torch.tensor([[11, 12], [21, 22]], dtype=torch.int32, device=DEVICE)
-    metadata = MomeAttentionMetadata(
+    metadata = ModAttnAttentionMetadata(
         num_prefills=0,
         num_prefill_tokens=0,
         num_decodes=2,
@@ -321,7 +321,7 @@ def test_mome_cudagraph_capture_pads_decode_metadata():
     )
 
 
-def test_mome_update_block_table_splits_decode_and_prefill_rows():
+def test_mod_attn_update_block_table_splits_decode_and_prefill_rows():
     builder = _make_builder()
     common = _make_common(
         seq_lens=[17, 32, 20],
@@ -345,7 +345,7 @@ def test_mome_update_block_table_splits_decode_and_prefill_rows():
     torch.testing.assert_close(updated.state_indices_tensor_p, new_block_table[2:])
 
 
-def test_mome_update_block_table_rejects_wrong_request_count():
+def test_mod_attn_update_block_table_rejects_wrong_request_count():
     builder = _make_builder()
     common = _make_common(
         seq_lens=[17, 32, 20],

@@ -118,7 +118,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_attn_diffkv import FlashAttentionDiffKVBackend
-from vllm.v1.kv_cache_interface import SlidingWindowMomeSpec
+from vllm.v1.kv_cache_interface import SlidingWindowModAttnSpec
 
 from .utils import get_pp_missing_layer_names
 
@@ -130,10 +130,10 @@ def check_ffn_act_fn(act_fn: str):
         )
 
 
-@CustomOp.register("MomeAttention")
-class MomeAttention(AttentionLayerBase, CustomOp):
+@CustomOp.register("ModAttn")
+class ModAttn(AttentionLayerBase, CustomOp):
     """
-    MoME attention layer with vLLM KV cache management.
+    ModAttn attention layer with vLLM KV cache management.
     Handles 3-part convolution state (q, kv, o).
     """
 
@@ -219,12 +219,12 @@ class MomeAttention(AttentionLayerBase, CustomOp):
         max_window_size = self.kernel_size - 1 + self.num_spec_tokens
         return round_up(max_window_size, 8)
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> SlidingWindowMomeSpec:
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> SlidingWindowModAttnSpec:
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
         cache_window_size = self._get_cache_window_size()
-        return SlidingWindowMomeSpec(
+        return SlidingWindowModAttnSpec(
             block_size=cache_window_size,
             num_kv_heads=1,
             head_size=self.cache_head_size,
@@ -236,9 +236,9 @@ class MomeAttention(AttentionLayerBase, CustomOp):
         )
 
     def get_attn_backend(self) -> type:
-        from vllm.v1.attention.backends.mome_attn import MomeAttentionBackend
+        from vllm.v1.attention.backends.mod_attn import ModAttnAttentionBackend
 
-        return MomeAttentionBackend
+        return ModAttnAttentionBackend
 
     def forward(self, hidden_states: torch.Tensor, state_indice: int) -> torch.Tensor:
         output = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
@@ -253,7 +253,7 @@ class MomeAttention(AttentionLayerBase, CustomOp):
             hidden_size = self.o_dim
         conv_weight = conv_weight.view(hidden_size, self.kernel_size)
         conv_state = self.kv_cache[state_indice]
-        torch.ops.vllm.mome_attention(
+        torch.ops.vllm.mod_attn(
             hidden_states,
             conv_state,
             conv_weight,
@@ -264,7 +264,7 @@ class MomeAttention(AttentionLayerBase, CustomOp):
         return output
 
 
-def mome_attention(
+def mod_attn(
     hidden_states: torch.Tensor,
     conv_state: torch.Tensor,
     conv_weight: torch.Tensor,
@@ -278,32 +278,32 @@ def mome_attention(
         return
 
     conv_state_ = conv_state.transpose(-1, -2)
-    mome_metadata = forward_context.attn_metadata[layer_name]
-    num_decode_tokens = mome_metadata.num_decode_tokens
-    num_prefill_tokens = mome_metadata.num_prefill_tokens
+    mod_attn_metadata = forward_context.attn_metadata[layer_name]
+    num_decode_tokens = mod_attn_metadata.num_decode_tokens
+    num_prefill_tokens = mod_attn_metadata.num_prefill_tokens
     num_actual_tokens = num_decode_tokens + num_prefill_tokens
-    num_decodes = mome_metadata.num_decodes
-    num_prefills = mome_metadata.num_prefills
+    num_decodes = mod_attn_metadata.num_decodes
+    num_prefills = mod_attn_metadata.num_prefills
     if num_decodes > 0:
         decode_hidden_states = hidden_states[:num_decode_tokens].clone()
-        decode_state_indices = mome_metadata.state_indices_tensor_d
+        decode_state_indices = mod_attn_metadata.state_indices_tensor_d
         decode_block_idx_last_scheduled_token = (
-            mome_metadata.block_idx_last_scheduled_token_d
+            mod_attn_metadata.block_idx_last_scheduled_token_d
         )
         decode_block_idx_last_computed_token = (
-            mome_metadata.block_idx_last_computed_token_d
+            mod_attn_metadata.block_idx_last_computed_token_d
         )
-        query_start_loc_d = mome_metadata.query_start_loc_d
-        num_accepted_tokens = mome_metadata.num_accepted_tokens
+        query_start_loc_d = mod_attn_metadata.query_start_loc_d
+        num_accepted_tokens = mod_attn_metadata.num_accepted_tokens
         assert decode_state_indices is not None
         assert decode_block_idx_last_scheduled_token is not None
         assert decode_block_idx_last_computed_token is not None
         if query_start_loc_d is not None and num_accepted_tokens is not None:
-            assert mome_metadata.max_decode_query_len is not None
+            assert mod_attn_metadata.max_decode_query_len is not None
             conv_state_indices = decode_state_indices.contiguous()
             block_idx_last_scheduled_token = decode_block_idx_last_scheduled_token
             initial_state_idx = decode_block_idx_last_computed_token
-            max_query_len = mome_metadata.max_decode_query_len
+            max_query_len = mod_attn_metadata.max_decode_query_len
         else:
             conv_state_indices = decode_state_indices[:num_decodes].contiguous()
             block_idx_last_scheduled_token = decode_block_idx_last_scheduled_token[
@@ -329,20 +329,20 @@ def mome_attention(
         )
         output[:num_decode_tokens] = decode_output
 
-    num_prefills = mome_metadata.num_prefills
+    num_prefills = mod_attn_metadata.num_prefills
     if num_prefills > 0:
-        query_start_loc = mome_metadata.query_start_loc_p
-        prefill_state_indices = mome_metadata.state_indices_tensor_p
+        query_start_loc = mod_attn_metadata.query_start_loc_p
+        prefill_state_indices = mod_attn_metadata.state_indices_tensor_p
         prefill_block_idx_first_scheduled_token = (
-            mome_metadata.block_idx_first_scheduled_token_p
+            mod_attn_metadata.block_idx_first_scheduled_token_p
         )
         prefill_block_idx_last_scheduled_token = (
-            mome_metadata.block_idx_last_scheduled_token_p
+            mod_attn_metadata.block_idx_last_scheduled_token_p
         )
         prefill_block_idx_last_computed_token = (
-            mome_metadata.block_idx_last_computed_token_p
+            mod_attn_metadata.block_idx_last_computed_token_p
         )
-        num_computed_tokens_p = mome_metadata.num_computed_tokens_p
+        num_computed_tokens_p = mod_attn_metadata.num_computed_tokens_p
         assert query_start_loc is not None
         assert prefill_state_indices is not None
         assert prefill_block_idx_first_scheduled_token is not None
@@ -356,7 +356,7 @@ def mome_attention(
             bias=None,
             activation=None,
             conv_states=conv_state_,
-            has_initial_state=mome_metadata.has_initial_states_p,
+            has_initial_state=mod_attn_metadata.has_initial_states_p,
             cache_indices=prefill_state_indices[:num_prefills].contiguous(),
             query_start_loc=query_start_loc,
             block_idx_first_scheduled_token=(
@@ -368,13 +368,13 @@ def mome_attention(
             initial_state_idx=prefill_block_idx_last_computed_token[:num_prefills],
             num_computed_tokens=num_computed_tokens_p[:num_prefills],
             block_size_to_align=conv_state_.size(-1),
-            metadata=mome_metadata,
+            metadata=mod_attn_metadata,
             zero_initial_state_output=True,
         ).transpose(0, 1)
         output[num_decode_tokens:num_actual_tokens] = prefill_output
 
 
-def mome_attention_fake(
+def mod_attn_fake(
     hidden_states: torch.Tensor,
     conv_state: torch.Tensor,
     conv_weight: torch.Tensor,
@@ -386,16 +386,16 @@ def mome_attention_fake(
 
 
 direct_register_custom_op(
-    op_name="mome_attention",
-    op_func=mome_attention,
+    op_name="mod_attn",
+    op_func=mod_attn,
     mutates_args=["conv_state", "output"],
-    fake_impl=mome_attention_fake,
+    fake_impl=mod_attn_fake,
 )
 
 
 @PluggableLayer.register("static_sink_multi_head_latent_attention")
 class StaticSinkMultiHeadLatentAttentionWrapper(PluggableLayer):
-    """OpenPangu MLA layer with static sink tokens and optional MoME."""
+    """OpenPangu MLA layer with static sink tokens and optional ModAttn."""
 
     def __init__(
         self,
@@ -413,7 +413,7 @@ class StaticSinkMultiHeadLatentAttentionWrapper(PluggableLayer):
         prefix: str = "",
         sink_len: int = 0,
         sliding_window: int | None = None,
-        mome_attn: torch.nn.Module | None = None,
+        mod_attn: torch.nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -436,7 +436,7 @@ class StaticSinkMultiHeadLatentAttentionWrapper(PluggableLayer):
         self.indexer = mla_modules.indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
-        self.mome_attn = mome_attn
+        self.mod_attn = mod_attn
         self.prefix = prefix
 
         if self.indexer is not None:
@@ -490,9 +490,9 @@ class StaticSinkMultiHeadLatentAttentionWrapper(PluggableLayer):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
-            if self.mome_attn is not None:
-                mome_output = self.mome_attn(q_c, state_indice=0)
-                q_c = mome_output + q_c
+            if self.mod_attn is not None:
+                mod_attn_output = self.mod_attn(q_c, state_indice=0)
+                q_c = mod_attn_output + q_c
             q_c = self.q_a_layernorm(q_c)
             q = self.q_b_proj(q_c)[0]
         else:
@@ -506,8 +506,8 @@ class StaticSinkMultiHeadLatentAttentionWrapper(PluggableLayer):
             q = self.q_proj(hidden_states)[0]
 
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        if self.mome_attn is not None:
-            kv_c = self.mome_attn(kv_c, state_indice=1) + kv_c
+        if self.mod_attn is not None:
+            kv_c = self.mod_attn(kv_c, state_indice=1) + kv_c
         kv_c_normed = self.kv_a_layernorm(kv_c)
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
@@ -537,8 +537,8 @@ class StaticSinkMultiHeadLatentAttentionWrapper(PluggableLayer):
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
         )
 
-        if self.mome_attn is not None:
-            attn_out = self.mome_attn(attn_out, state_indice=2) + attn_out
+        if self.mod_attn is not None:
+            attn_out = self.mod_attn(attn_out, state_indice=2) + attn_out
         output = self.o_proj(attn_out)[0]
         return output
 
@@ -914,12 +914,12 @@ class OpenPanguMLAAttention(nn.Module):
             self.indexer_rope_emb = None
             self.indexer = None
         self.sliding_window = sliding_window
-        # MOME
-        if getattr(config, "use_mome", False):
+        # MOD_ATTN
+        if getattr(config, "use_mod_attn", getattr(config, "use_mome", False)):
             spec_token_num = 0
             if vllm_config.speculative_config:
                 spec_token_num = vllm_config.speculative_config.num_speculative_tokens
-            self.mome_attn = MomeAttention(
+            self.mod_attn = ModAttn(
                 kernel_size=config.router_sliding_window,
                 num_spec_tokens=spec_token_num,
                 q_lora_rank=self.q_lora_rank,
@@ -929,10 +929,10 @@ class OpenPanguMLAAttention(nn.Module):
                 v_head_dim=self.v_head_dim,
                 cache_alignment=self.kv_lora_rank + self.qk_rope_head_dim,
                 vllm_config=vllm_config,
-                prefix=f"{prefix}.mome_attn",
+                prefix=f"{prefix}.mod_attn",
             )
         else:
-            self.mome_attn = None
+            self.mod_attn = None
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
             kv_b_proj=self.kv_b_proj,
@@ -983,7 +983,7 @@ class OpenPanguMLAAttention(nn.Module):
                 prefix,
                 sink_len=self.param_sink_number,
                 sliding_window=sliding_window,
-                mome_attn=self.mome_attn,
+                mod_attn=self.mod_attn,
             )
             self.param_sink_k_pe = torch.nn.Parameter(
                 torch.empty(
@@ -2016,17 +2016,17 @@ class OpenPanguModel(nn.Module):
                 if ".self_attn.qa_conv.weight" in name:
                     name = name.replace(
                         ".self_attn.qa_conv.weight",
-                        ".self_attn.mome_attn.qa_conv.weight",
+                        ".self_attn.mod_attn.qa_conv.weight",
                     )
                 if ".self_attn.compresskv_conv.weight" in name:
                     name = name.replace(
                         ".self_attn.compresskv_conv.weight",
-                        ".self_attn.mome_attn.compresskv_conv.weight",
+                        ".self_attn.mod_attn.compresskv_conv.weight",
                     )
                 if ".self_attn.o_conv.weight" in name:
                     name = name.replace(
                         ".self_attn.o_conv.weight",
-                        ".self_attn.mome_attn.o_conv.weight",
+                        ".self_attn.mod_attn.o_conv.weight",
                     )
                 if name is None:
                     continue
